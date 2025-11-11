@@ -12,10 +12,11 @@ def load_data(symbol="GDX.AX", period="90d", interval="1h"):
     closes = [float(v) for v in df["Close"].values]
     highs  = [float(v) for v in df["High"].values]
     lows   = [float(v) for v in df["Low"].values]
+    dates  = [str(idx) for idx in df.index]   # List of date strings
 
-    return highs, lows, closes
+    return highs, lows, closes, dates
 
-highs, lows, closes = load_data()
+highs, lows, closes, dates = load_data()
 
 # =====================================================
 # INDICATORS (NO NUMPY, PURE PYTHON MATH)
@@ -50,7 +51,7 @@ def atr(highs, lows, closes, length, idx):
     return s / length
 
 # =====================================================
-# BACKTEST STRATEGY (w/Stats Tracking)
+# BACKTEST STRATEGY (w/Trade Log with Dates)
 # =====================================================
 def backtest(params):
     lookback, sens, ma_len, stop_loss, rr = params
@@ -60,12 +61,13 @@ def backtest(params):
     max_drawdown = 0.0
     in_position = False
     entry = 0.0
+    entry_idx = None
 
     trades = 0
     wins = 0
     pnl = []
-
     equity_curve = []
+    trade_log = []  # <--- Trade log
 
     for i in range(len(closes)):
         # Dynamic support
@@ -91,6 +93,7 @@ def backtest(params):
 
             in_position = True
             entry = closes[i]
+            entry_idx = i
 
         # Manage open trade
         if in_position:
@@ -101,15 +104,33 @@ def backtest(params):
             if lows[i] <= stop_price:
                 balance *= stop_price / entry
                 trades += 1
+                trade_log.append({
+                    "entry_date": dates[entry_idx],
+                    "exit_date": dates[i],
+                    "entry_price": entry,
+                    "exit_price": stop_price,
+                    "pnl_pct": (stop_price - entry) / entry * 100,
+                    "type": "loss"
+                })
                 pnl.append((stop_price - entry) / entry)
                 in_position = False
+                entry_idx = None
             # Take profit hit
             elif highs[i] >= target:
                 balance *= target / entry
                 trades += 1
+                trade_log.append({
+                    "entry_date": dates[entry_idx],
+                    "exit_date": dates[i],
+                    "entry_price": entry,
+                    "exit_price": target,
+                    "pnl_pct": (target - entry) / entry * 100,
+                    "type": "win"
+                })
                 pnl.append((target - entry) / entry)
                 wins += 1
                 in_position = False
+                entry_idx = None
 
         # Track equity curve for drawdown
         equity_curve.append(balance)
@@ -129,7 +150,8 @@ def backtest(params):
         "win_rate": win_rate,
         "trades": trades,
         "pnl": total_pnl,
-        "params": params
+        "params": params,
+        "trade_log": trade_log
     }
 
 # =====================================================
@@ -153,7 +175,7 @@ def worker(_):
     return result
 
 # =====================================================
-# OPTIMIZER (Top 10 w/Full Stats)
+# OPTIMIZER (Top 10 w/Full Stats + Print 1st Trade Log)
 # =====================================================
 def optimize(trials=300):
     with mp.Pool(mp.cpu_count()) as pool:
@@ -172,6 +194,10 @@ def optimize(trials=300):
             f"PnL {res['pnl']:.2f}% | "
             f"lookback={lookback}, sens={sens:.3f}, ma={ma}, SL={sl:.3f}, RR={rr:.3f}"
         )
+    # Print trade log of best run
+    print("\nSample trades from best result:")
+    for t in results[0]['trade_log'][:10]:  # print first 10 trades
+        print(t)
 
     print("\nBEST:", results[0])
 
