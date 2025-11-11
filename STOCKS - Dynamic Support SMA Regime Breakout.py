@@ -2,25 +2,17 @@ import yfinance as yf
 import random
 import multiprocessing as mp
 
-# =====================================================
-# LOAD DATA (100% Safe Numeric OHLC for GDX.AX)
-# =====================================================
+SYMBOLS = ["APA.AX", "GDX.AX", "GOLD.AX", "LTR.AX", "NAB.AX", "NDQ.AX", "PLS.AX", "WDS.AX"]
+
 def load_data(symbol="GDX.AX", period="90d", interval="1h"):
     tk = yf.Ticker(symbol)
     df = tk.history(period=period, interval=interval).dropna()
-
     closes = [float(v) for v in df["Close"].values]
     highs  = [float(v) for v in df["High"].values]
     lows   = [float(v) for v in df["Low"].values]
-    dates  = [str(idx) for idx in df.index]   # List of date strings
-
+    dates  = [str(idx) for idx in df.index]
     return highs, lows, closes, dates
 
-highs, lows, closes, dates = load_data()
-
-# =====================================================
-# INDICATORS (NO NUMPY, PURE PYTHON MATH)
-# =====================================================
 def sma(arr, length, idx):
     if idx < length:
         return arr[idx]
@@ -50,10 +42,7 @@ def atr(highs, lows, closes, length, idx):
         s += tr
     return s / length
 
-# =====================================================
-# BACKTEST STRATEGY (w/Trade Log with Dates)
-# =====================================================
-def backtest(params):
+def backtest(params, highs, lows, closes, dates):
     lookback, sens, ma_len, stop_loss, rr = params
 
     balance = 1.0
@@ -67,40 +56,30 @@ def backtest(params):
     wins = 0
     pnl = []
     equity_curve = []
-    trade_log = []  # <--- Trade log
+    trade_log = []
 
     for i in range(len(closes)):
-        # Dynamic support
         supp = lowest(lows, lookback, i) + atr(highs, lows, closes, 14, i) * sens * 0.5
         ma = sma(closes, ma_len, i)
-
-        # Regime filters
         sma20  = sma(closes, 20, i)
         sma50  = sma(closes, 50, i)
         sma200 = sma(closes, 200, i)
-
         atr_now  = atr(highs, lows, closes, 14, i)
         atr_prev = atr(highs, lows, closes, 14, i-3) if i >= 3 else atr_now
-
         trending = (sma20 > sma50) and (closes[i] > sma200) and (atr_now > atr_prev)
 
-        # BUY: SMA crosses above support while trending
         if (not in_position
             and i > 1
             and ma > supp
             and sma(closes, ma_len, i-1) <= supp
             and trending):
-
             in_position = True
             entry = closes[i]
             entry_idx = i
 
-        # Manage open trade
         if in_position:
             stop_price = entry * (1 - stop_loss)
             target = entry + ((entry - stop_price) * rr)
-
-            # Stop loss hit
             if lows[i] <= stop_price:
                 balance *= stop_price / entry
                 trades += 1
@@ -115,7 +94,6 @@ def backtest(params):
                 pnl.append((stop_price - entry) / entry)
                 in_position = False
                 entry_idx = None
-            # Take profit hit
             elif highs[i] >= target:
                 balance *= target / entry
                 trades += 1
@@ -132,7 +110,6 @@ def backtest(params):
                 in_position = False
                 entry_idx = None
 
-        # Track equity curve for drawdown
         equity_curve.append(balance)
         if balance > peak_balance:
             peak_balance = balance
@@ -140,13 +117,12 @@ def backtest(params):
         if dd > max_drawdown:
             max_drawdown = dd
 
-    # Win rate calculation
     win_rate = (wins / trades) * 100 if trades > 0 else 0
-    total_pnl = (balance - 1.0) * 100  # as percent
+    total_pnl = (balance - 1.0) * 100  # percent
 
     return {
         "final_balance": balance,
-        "drawdown": max_drawdown * 100,  # as percent
+        "drawdown": max_drawdown * 100,
         "win_rate": win_rate,
         "trades": trades,
         "pnl": total_pnl,
@@ -154,55 +130,68 @@ def backtest(params):
         "trade_log": trade_log
     }
 
-# =====================================================
-# PARAMETER GENERATOR
-# =====================================================
 def random_params():
     return (
-        random.randint(2, 200),       # lookback
-        random.uniform(0.5, 3.0),     # sensitivity
-        random.randint(2, 200),       # SMA length
-        random.uniform(0.01, 0.20),   # stop loss %
-        random.uniform(1, 20)         # RR
+        random.randint(2, 200),
+        random.uniform(0.5, 3.0),
+        random.randint(2, 200),
+        random.uniform(0.01, 0.20),
+        random.uniform(1, 20)
     )
 
-# =====================================================
-# MULTI-CORE WORKER
-# =====================================================
-def worker(_):
-    params = random_params()
-    result = backtest(params)
+def worker(args):
+    params, highs, lows, closes, dates = args
+    result = backtest(params, highs, lows, closes, dates)
     return result
 
-# =====================================================
-# OPTIMIZER (Top 10 w/Full Stats + Print 1st Trade Log)
-# =====================================================
-def optimize(trials=300):
+def optimize_for_symbol(symbol, trials=500):
+    highs, lows, closes, dates = load_data(symbol, period="90d", interval="1h")
+    args = [(random_params(), highs, lows, closes, dates) for _ in range(trials)]
     with mp.Pool(mp.cpu_count()) as pool:
-        results = list(pool.imap(worker, range(trials)))
-
+        results = list(pool.imap(worker, args))
     results.sort(reverse=True, key=lambda x: x["final_balance"])
+    best = results[0]
+    best["symbol"] = symbol
+    return best
 
-    print("\n===== TOP 10 RESULTS =====\n")
-    for rank, res in enumerate(results[:10], start=1):
-        lookback, sens, ma, sl, rr = res["params"]
+def main():
+    all_best = []
+    print("\nRunning backtest for symbols:")
+    for symbol in SYMBOLS:
+        print(f"\n=== {symbol} ===")
+        best = optimize_for_symbol(symbol, trials=500)  # adjust trials for more/less search
+        print(f"Top result for {symbol}:")
         print(
-            f"{rank}. Return {res['final_balance']:.4f} | "
+            f"Return {best['final_balance']:.4f} | "
+            f"Drawdown {best['drawdown']:.2f}% | "
+            f"Win rate {best['win_rate']:.2f}% | "
+            f"Trades {best['trades']} | "
+            f"PnL {best['pnl']:.2f}% | "
+            f"Params={best['params']}"
+        )
+        all_best.append(best)
+
+    # Sort by highest PnL
+    all_best.sort(reverse=True, key=lambda x: x["pnl"])
+    print("\n\n===== FINAL RANKING (Highest PnL) =====")
+    for rank, res in enumerate(all_best, start=1):
+        print(
+            f"{rank}. {res['symbol']} | PnL {res['pnl']:.2f}% | "
+            f"Return {res['final_balance']:.4f} | "
             f"Drawdown {res['drawdown']:.2f}% | "
             f"Win rate {res['win_rate']:.2f}% | "
             f"Trades {res['trades']} | "
-            f"PnL {res['pnl']:.2f}% | "
-            f"lookback={lookback}, sens={sens:.3f}, ma={ma}, SL={sl:.3f}, RR={rr:.3f}"
+            f"Params={res['params']}"
         )
-    # Print trade log of best run
-    print("\nSample trades from best result:")
-    for t in results[0]['trade_log'][:10]:  # print first 10 trades
-        print(t)
+        print("Trade log (first 10 trades):")
+        for t in res['trade_log'][:10]:
+            print(
+                f"  Entry: {t['entry_date']} @ {t['entry_price']:.2f} | "
+                f"Exit: {t['exit_date']} @ {t['exit_price']:.2f} | "
+                f"{t['type'].upper()} | "
+                f"PnL: {t['pnl_pct']:.2f}%"
+            )
+        print("-" * 60)
 
-    print("\nBEST:", results[0])
-
-# =====================================================
-# RUN
-# =====================================================
 if __name__ == "__main__":
-    optimize(50000)
+    main()
